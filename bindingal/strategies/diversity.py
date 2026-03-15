@@ -1,12 +1,16 @@
-from torch.utils.data import DataLoader
 from typing import List
+
+from torch.utils.data import DataLoader
+
 from .base import BaseSelector
+
 
 # TODO: Implement diversity-based sampling strategy
 class DiversitySelector(BaseSelector):
     """
     Batch mode with diversity-based sampling strategy for active learning.
     """
+
     def __init__(self, model):
         pass
 

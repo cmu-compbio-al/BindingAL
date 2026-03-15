@@ -1,13 +1,16 @@
-import torch
-from transformers import AutoTokenizer, AutoModel
 from typing import List
+
+import torch
+from transformers import AutoModel, AutoTokenizer
+
 
 class EmbeddingExtractor:
     """
     A class for extracting embeddings from a pre-trained language model.
     It can load model from huggingface or from a local path, and provides a method to extract embeddings for a given input text.
     """
-    def __init__(self, model_name_or_path: str, device: str = 'cpu'):
+
+    def __init__(self, model_name_or_path: str, device: str = "cpu"):
         """
         Initializes the embedding extractor by loading the model and tokenizer.
 
@@ -19,7 +22,7 @@ class EmbeddingExtractor:
         self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
         self.model = AutoModel.from_pretrained(model_name_or_path).to(self.device)
         self.model.eval()
-    
+
     @torch.no_grad()
     def extract(self, sequences: List[str]) -> torch.Tensor:
         """
@@ -27,7 +30,7 @@ class EmbeddingExtractor:
 
         Args:
             sequences (List[str]): A list of input text sequences.
-        
+
         Returns:
             embeddings (torch.Tensor): A tensor containing the extracted embeddings for the input sequences.
         """
