@@ -43,6 +43,6 @@ uv run ruff check --fix .
 > Note: the training/extraction scripts are currently placeholders.
 
 ```bash
-uv run python -m scripts.extract
-uv run python -m scripts.train
+uv run python scripts/extract.py
+uv run python scripts/train.py
 ```
