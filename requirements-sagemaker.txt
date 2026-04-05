@@ -118,7 +118,6 @@ pexpect==4.9.0
 pillow==12.1.1
 platformdirs==4.9.4
 pluggy==1.6.0
-pre_commit==4.5.1
 prettytable==3.17.0
 prompt_toolkit==3.0.52
 propcache==0.4.1
@@ -148,7 +147,6 @@ regex==2026.2.28
 requests==2.33.1
 rich==14.3.3
 rpds-py==0.30.0
-ruff==0.15.6
 s3transfer==0.16.0
 safetensors==0.7.0
 sagemaker==3.7.0

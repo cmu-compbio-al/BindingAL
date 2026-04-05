@@ -3,7 +3,7 @@ A scalable active learning framework for biomolecular binding prediction.
 
 ## 🚀 Getting Started
 
-This project uses `conda` (or any virtualenv) for environment management and `pip` + `requirements.txt` for Python dependencies.
+This project uses `conda` (or any virtualenv) for environment management and `pip` + `requirements.txt` for Python dependencies. The package is also configured for installation (editable or regular) via `pyproject.toml`.
 
 ### 1. Set up a Python environment
 From the repository root:
@@ -14,10 +14,16 @@ conda activate bindingal
 
 If you prefer `python -m venv`, that is also fine.
 
-### 2. Install dependencies
+### 2. Install dependencies and the package (local clone)
 ```bash
 pip install -r requirements.txt
-pip install -e .  # optional but recommended for `import bindingal`
+pip install -e .  # install `bindingal` in editable mode
+```
+
+Once the project is published to a package index, other users will be able to install it directly with:
+
+```bash
+pip install bindingal
 ```
 
 ---
