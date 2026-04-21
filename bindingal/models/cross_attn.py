@@ -23,7 +23,7 @@ class AttentionPooling(nn.Module):
             pooled: attention-weighted pooled embedding of shape (B, D)
         """
         scores = self.score(x).squeeze(-1)
-        scores = scores.masked_fill(~valid_mask, float('-inf'))
+        scores = scores.masked_fill(~valid_mask.bool(), float('-inf'))
         weights = torch.softmax(scores, dim=-1)
         out = (weights.unsqueeze(-1) * x).sum(dim=1)
 
@@ -79,7 +79,7 @@ class CrossAttentionLayer(nn.Module):
         ag_out = self.norm_ag(ag + self.dropout(ag_out))
  
         # Merge outputs by concatenating the attention-pooled antigen summary to each antibody token, then projecting back to embed_dim
-        ag_valid = (~ag_pad_mask).float() # (B, L_ag)
+        ag_valid = (~ag_pad_mask.bool()).float() # (B, L_ag)
         ag_summary = self.pool(ag_out, ag_valid) # (B, D)
         ag_summary = ag_summary.unsqueeze(1).expand_as(ab_out) # (B, L_ab, D)
  
