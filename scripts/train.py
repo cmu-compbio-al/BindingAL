@@ -10,13 +10,12 @@ import psutil
 
 import boto3
 import numpy as np
-import pandas as pd
 
 from botocore.exceptions import NoCredentialsError
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 from ray.train.torch import TorchTrainer, prepare_model
-from ray.train import ScalingConfig, get_dataset_shard, report, Checkpoint, RunConfig
+from ray.train import ScalingConfig, get_dataset_shard, report, Checkpoint, RunConfig, CheckpointConfig
 from ray.data import ActorPoolStrategy
 from ray.train import get_context
 
@@ -24,6 +23,25 @@ from bindingal.models import get_model
 from bindingal.strategies.uncertainty import UncertaintySelector
 
 from utils.distributed import _get_sagemaker_hosts, _get_current_host, _get_num_gpus, init_ray_cluster
+
+def inject_aws_credentials():
+    try:
+        session = boto3.Session()
+        credentials = session.get_credentials()
+        if credentials:
+            frozen = credentials.get_frozen_credentials()
+            os.environ["AWS_ACCESS_KEY_ID"] = frozen.access_key
+            os.environ["AWS_SECRET_ACCESS_KEY"] = frozen.secret_key
+            if frozen.token:
+                os.environ["AWS_SESSION_TOKEN"] = frozen.token
+        if session.region_name:
+            os.environ["AWS_REGION"] = session.region_name
+            os.environ["AWS_DEFAULT_REGION"] = session.region_name
+        print("AWS Credentials successfully injected for Ray workers.")
+    except Exception as e:
+        print(f"Warning: Could not inject AWS credentials: {e}")
+    
+    return
 
 class EmbeddingMapper:
     def __init__(self, embed_dict_ref):
@@ -138,11 +156,10 @@ def train_loop_per_worker(config):
 
     # Retrieve the model from the config
     model = get_model("cross_attn", embed_dim=1536, num_heads=8)
-    model.load_state_dict(config["model_state_dict"])
     model = prepare_model(model)
 
     criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=config["learning_rate"])
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=1e-4)
 
     rank = get_context().get_world_rank()
 
@@ -317,29 +334,46 @@ def train_model(config, train_ds, val_ds):
 
     # Initialize performance tracking
     current_performance = 0.0
-    selected_data = train_ds.take(query_size)  # Random initial batch
+    selected_data = train_ds.take(1000)  # Random initial batch size: 1000
     report_data = []
 
-    # Train the model on the initial batch
+    # Initial training on the first batch to get a starting performance metric
     fine_tune_ds = ray.data.from_items(selected_data)
-    for epoch in range(epochs):
-        model.train()
-        train_loss_sum = 0.0
-        train_total = 0
-        for batch in fine_tune_ds.iter_batches(batch_size=batch_size, batch_format="numpy"):
-            loss, _, n = run_forward(model, batch, criterion)
-            optimizer = torch.optim.Adam(model.parameters(), lr=config["learning_rate"])
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            train_loss_sum += loss.item() * n
-            train_total += n
+    fresh_model = get_model("cross_attn", embed_dim=1536, num_heads=8)
+    config["model_state_dict"] = {k: v.cpu() for k, v in fresh_model.state_dict().items()}
 
-        train_loss = train_loss_sum / train_total if train_total > 0 else 0.0
-        print(f"Epoch {epoch}: Initial Training Loss={train_loss:.4f}")
+    print("Phase 0: Initial Training on 1,000 samples using DDP...")
+    trainer = TorchTrainer(
+        train_loop_per_worker,
+        train_loop_config=config,
+        datasets={"train": fine_tune_ds, "val": val_ds},
+        run_config=RunConfig(
+            storage_path=config.get("s3_artifact_path"),
+            name="train_initial",
+            checkpoint_config=CheckpointConfig(
+                num_to_keep=1,
+                checkpoint_score_attribute="val_acc",
+                checkpoint_score_order="max",
+            ),
+        ),
+        scaling_config=scaling_cfg,
+    )
+    result = trainer.fit()
+
+    if result.checkpoint:
+        with result.checkpoint.as_directory() as ckpt_dir:
+            ckpt_state = torch.load(os.path.join(ckpt_dir, "model.pt"), map_location=device)
+        cleaned_state = {k.replace("module.", ""): v for k, v in ckpt_state.items()}
+        model.load_state_dict(cleaned_state)
+        model.to(device)
+        model.eval()
+
+    current_performance = result.metrics["val_acc"]
+    print(f"Phase 0 Completed. Initial Validation Accuracy: {current_performance:.4f}")
 
     batch_num = 0
-    while current_performance < finetune_performance_threshold:
+    print(f"Phase 1: Active Learning with strategy '{strategy}'")
+    while batch_num <= 20:
         print(f"Current performance: {current_performance:.4f}, Threshold: {finetune_performance_threshold:.4f}")
 
         # Select batch based on strategy
@@ -361,9 +395,11 @@ def train_model(config, train_ds, val_ds):
 
         fine_tune_ds = ray.data.from_items(selected_data)
 
-        # Add the model to the config
-        cpu_state_dict = {k: v.cpu() for k, v in model.state_dict().items()}
-        config["model_state_dict"] = cpu_state_dict
+        fresh_model = get_model("cross_attn", embed_dim=1536, num_heads=8)
+        config["model_state_dict"] = {k: v.cpu() for k, v in fresh_model.state_dict().items()}
+        
+        model.to("cpu")
+        torch.cuda.empty_cache()
 
         # Fine-tune the model using DDP
         trainer = TorchTrainer(
@@ -373,16 +409,21 @@ def train_model(config, train_ds, val_ds):
             run_config=RunConfig(
                 storage_path=config.get("s3_artifact_path"),
                 name=f"train_iter_{batch_num}",
+                checkpoint_config=CheckpointConfig(
+                    num_to_keep=1,
+                    checkpoint_score_attribute="val_acc",
+                    checkpoint_score_order="max",
+                ),
             ),
             scaling_config=scaling_cfg,
         )
         result = trainer.fit()
 
-        if result.checkpoint:
-            with result.checkpoint.as_directory() as ckpt_dir:
-                ckpt_state = torch.load(os.path.join(ckpt_dir, "model.pt"), map_location=device)
-            cleaned_state = {k.replace("module.", ""): v for k, v in ckpt_state.items()}
-            model.load_state_dict(cleaned_state)
+        model.to(device)
+        with result.checkpoint.as_directory() as ckpt_dir:
+            ckpt_state = torch.load(os.path.join(ckpt_dir, "model.pt"), map_location=device)
+        cleaned_state = {k.replace("module.", ""): v for k, v in ckpt_state.items()}
+        model.load_state_dict(cleaned_state)
 
         # Evaluate performance on validation set
         model.eval()
@@ -394,24 +435,18 @@ def train_model(config, train_ds, val_ds):
                 val_correct += correct_t
                 val_total += n_t
 
-        current_performance = val_correct / val_total if val_total > 0 else 0.0
+        val_acc = val_correct / val_total if val_total > 0 else 0.0
         val_loss = val_loss_sum / val_total if val_total > 0 else 0.0
-        print(f"Batch: {batch_num}, Validation Loss: {val_loss:.4f}, Validation Accuracy: {current_performance:.4f}")
+        print(f"Batch: {batch_num}, Validation Loss: {val_loss:.4f}, Validation Accuracy: {val_acc:.4f}")
 
         # Log progress to the report file
         report_entry = {
-            "current_performance": current_performance,
             "batch": batch_num,
             "strategy": strategy,
             "val_loss": val_loss,
+            "val_acc": val_acc,
         }
         report_data.append(report_entry)
-
-        # Prevent infinite loop in case of issues
-        if batch_num >= 50:
-            print("Stopping training early to prevent infinite loop.")
-            print(f"Current performance after {batch_num} batches: {current_performance:.4f}")
-            break
 
     # Save the final model
     write_report(report_file_path, report_data)
@@ -422,7 +457,7 @@ def train_model(config, train_ds, val_ds):
 
 if __name__ == "__main__":
     args = parse_args()
-
+    inject_aws_credentials()
     init_ray_cluster(num_workers_per_node=args.num_workers)
 
     hosts = _get_sagemaker_hosts()
@@ -436,7 +471,7 @@ if __name__ == "__main__":
 
     # Load and prepare data
     train_ds = load_and_prepare_data(args.train_data_path, args.embed_data_path)
-    
+
     # NOTE: Uncomment the block below to re-enable spike/COVID filtering.
     # covid_keywords = ['sars-cov-2', 'sars-cov2', 'covid-19', 'spike']
     # def _is_spike(record):
