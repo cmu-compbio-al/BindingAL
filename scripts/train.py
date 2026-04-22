@@ -189,10 +189,19 @@ def train_loop_per_worker(config):
                 val_loss_sum += loss.item() * n
                 val_correct += correct
                 val_total += n
-
-        val_loss = val_loss_sum / val_total if val_total > 0 else 0.0
-        val_acc = val_correct / val_total if val_total > 0 else 0.0
-
+        
+        # Aggregate metrics across workers
+        device = next(model.parameters()).device
+        val_correct_tensor = torch.tensor(val_correct, dtype=torch.float32).to(device)
+        val_loss_sum_tensor = torch.tensor(val_loss_sum, dtype=torch.float32).to(device)
+        val_total_tensor = torch.tensor(val_total, dtype=torch.float32).to(device)
+        torch.distributed.all_reduce(val_correct_tensor, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(val_loss_sum_tensor, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(val_total_tensor, op=torch.distributed.ReduceOp.SUM)
+ 
+        val_loss = (val_loss_sum_tensor / val_total_tensor).item() if val_total_tensor.item() > 0 else 0.0
+        val_acc = (val_correct_tensor / val_total_tensor).item() if val_total_tensor.item() > 0 else 0.0
+ 
         metrics = {"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss, "val_acc": val_acc}
 
         # Only rank 0 prints metrics
@@ -274,7 +283,7 @@ def load_and_prepare_data(train_data_path, embed_data_path):
             compute=ActorPoolStrategy(min_size=1, max_size=1),
         )
 
-    train_ds = map_embeddings(train_data)
+    train_ds = map_embeddings(train_data).materialize()
 
     return train_ds
 
@@ -305,11 +314,8 @@ def write_report(report_file_path, report_data):
 
 def train_model(config, train_ds, val_ds):
     """Train the model using query strategy-based active learning."""
-    strategy = config.get("strategy", "passive")  # Default to passive learning
-    batch_size = config["batch_size"]
-    query_size = config.get("query_size", 24)  # Default query size if not provided
-    epochs = config["epochs"]
-    finetune_performance_threshold = config["finetune_performance_threshold"]
+    strategy = config["strategy"]
+    query_size = config["query_size"]
     report_file_path = config["report_file_path"]
 
     # Initialize model and criterion
@@ -332,15 +338,12 @@ def train_model(config, train_ds, val_ds):
         },
     )
 
-    # Initialize performance tracking
-    current_performance = 0.0
+    # Initialize selected data with a random batch to start the active learning loop
     selected_data = train_ds.take(1000)  # Random initial batch size: 1000
     report_data = []
 
     # Initial training on the first batch to get a starting performance metric
     fine_tune_ds = ray.data.from_items(selected_data)
-    fresh_model = get_model("cross_attn", embed_dim=1536, num_heads=8)
-    config["model_state_dict"] = {k: v.cpu() for k, v in fresh_model.state_dict().items()}
 
     print("Phase 0: Initial Training on 1,000 samples using DDP...")
     trainer = TorchTrainer(
@@ -368,14 +371,18 @@ def train_model(config, train_ds, val_ds):
         model.to(device)
         model.eval()
 
-    current_performance = result.metrics["val_acc"]
-    print(f"Phase 0 Completed. Initial Validation Accuracy: {current_performance:.4f}")
+    best_idx = result.metrics_dataframe["val_acc"].idxmax()
+    val_acc = result.metrics_dataframe.loc[best_idx, "val_acc"]
+    val_loss = result.metrics_dataframe.loc[best_idx, "val_loss"]
+    print(f"Phase 0 Completed. Initial Validation Accuracy: {val_acc:.4f}, Initial Validation Loss: {val_loss:.4f}")
 
     batch_num = 0
+    # Track selected sample keys to prevent duplicate sampling across iterations
+    selected_keys = {record["heavy_seq"] + record["light_seq"] + record["antigen_seq"] for record in selected_data}
+
     print(f"Phase 1: Active Learning with strategy '{strategy}'")
     while batch_num <= 20:
-        print(f"Current performance: {current_performance:.4f}, Threshold: {finetune_performance_threshold:.4f}")
-
+        print(f"Starting active learning iteration {batch_num + 1} with strategy '{strategy}'...")
         # Select batch based on strategy
         batch_num += 1
         if strategy == "passive":
@@ -391,13 +398,11 @@ def train_model(config, train_ds, val_ds):
 
         selected_data.extend(batch)
         batch_full_seqs = {record["heavy_seq"] + record["light_seq"] + record["antigen_seq"] for record in batch}
-        train_ds = train_ds.filter(lambda r: (r["heavy_seq"] + r["light_seq"] + r["antigen_seq"]) not in batch_full_seqs)
+        selected_keys.update(batch_full_seqs)
+        train_ds = ray.data.from_items([r for r in train_ds.take_all() if (r["heavy_seq"] + r["light_seq"] + r["antigen_seq"]) not in selected_keys])
 
         fine_tune_ds = ray.data.from_items(selected_data)
 
-        fresh_model = get_model("cross_attn", embed_dim=1536, num_heads=8)
-        config["model_state_dict"] = {k: v.cpu() for k, v in fresh_model.state_dict().items()}
-        
         model.to("cpu")
         torch.cuda.empty_cache()
 
@@ -419,24 +424,17 @@ def train_model(config, train_ds, val_ds):
         )
         result = trainer.fit()
 
+        # Load best checkpoint weights into the outer model (used by active learning selectors next loop)
         model.to(device)
         with result.checkpoint.as_directory() as ckpt_dir:
             ckpt_state = torch.load(os.path.join(ckpt_dir, "model.pt"), map_location=device)
         cleaned_state = {k.replace("module.", ""): v for k, v in ckpt_state.items()}
         model.load_state_dict(cleaned_state)
-
-        # Evaluate performance on validation set
         model.eval()
-        val_loss_sum, val_total, val_correct = 0.0, 0, 0
-        with torch.no_grad():
-            for tb in val_ds.iter_batches(batch_size=batch_size, batch_format="numpy"):
-                loss_t, correct_t, n_t = run_forward(model, tb, criterion)
-                val_loss_sum += loss_t.item() * n_t
-                val_correct += correct_t
-                val_total += n_t
 
-        val_acc = val_correct / val_total if val_total > 0 else 0.0
-        val_loss = val_loss_sum / val_total if val_total > 0 else 0.0
+        best_idx = result.metrics_dataframe["val_acc"].idxmax()
+        val_acc = result.metrics_dataframe.loc[best_idx, "val_acc"]
+        val_loss = result.metrics_dataframe.loc[best_idx, "val_loss"]
         print(f"Batch: {batch_num}, Validation Loss: {val_loss:.4f}, Validation Accuracy: {val_acc:.4f}")
 
         # Log progress to the report file
