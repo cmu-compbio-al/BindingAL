@@ -24,22 +24,15 @@ from bindingal.strategies.uncertainty import UncertaintySelector
 
 from utils.distributed import _get_sagemaker_hosts, _get_current_host, _get_num_gpus, init_ray_cluster
 
-def inject_aws_credentials():
+def secure_aws_region_for_ray():
     try:
         session = boto3.Session()
-        credentials = session.get_credentials()
-        if credentials:
-            frozen = credentials.get_frozen_credentials()
-            os.environ["AWS_ACCESS_KEY_ID"] = frozen.access_key
-            os.environ["AWS_SECRET_ACCESS_KEY"] = frozen.secret_key
-            if frozen.token:
-                os.environ["AWS_SESSION_TOKEN"] = frozen.token
         if session.region_name:
             os.environ["AWS_REGION"] = session.region_name
             os.environ["AWS_DEFAULT_REGION"] = session.region_name
-        print("AWS Credentials successfully injected for Ray workers.")
+            print(f"AWS Region ({session.region_name}) successfully injected. Tokens will auto-refresh.")
     except Exception as e:
-        print(f"Warning: Could not inject AWS credentials: {e}")
+        print(f"Warning: Could not inject AWS Region: {e}")
     
     return
 
@@ -227,20 +220,28 @@ def save_model(state_dict, save_path):
         None
     """
     if save_path.startswith("s3://"):
-        s3 = boto3.client("s3")
-        bucket_name = save_path.split("/")[2]
-        s3_key = "/".join(save_path.split("/")[3:])
-        with tempfile.TemporaryDirectory() as tmpdir:
-            local_path = os.path.join(tmpdir, "model.pth")
-            torch.save(state_dict, local_path)
-            try:
-                s3.upload_file(local_path, bucket_name, s3_key)
-                print(f"Model successfully uploaded to {save_path}")
-            except NoCredentialsError:
-                print("S3 upload failed: No AWS credentials found.")
+        try:
+            s3 = boto3.client("s3")
+            bucket_name = save_path.split("/")[2]
+            s3_key = "/".join(save_path.split("/")[3:])
+            with tempfile.TemporaryDirectory() as tmpdir:
+                local_path = os.path.join(tmpdir, "model.pth")
+                torch.save(state_dict, local_path)
+                try:
+                    s3.upload_file(local_path, bucket_name, s3_key)
+                    print(f"Model successfully uploaded to {save_path}")
+                except NoCredentialsError:
+                    print("S3 upload failed: No AWS credentials found.")
+                except Exception as e:
+                    print(f"S3 upload failed: {e}")
+        except Exception as e:
+            print(f"Failed to initialize S3 client: {e}")
     else:
-        torch.save(state_dict, save_path)
-        print(f"Model successfully saved to {save_path}")
+        try:
+            torch.save(state_dict, save_path)
+            print(f"Model successfully saved to {save_path}")
+        except Exception as e:
+            print(f"Failed to save model locally: {e}")
 
 
 def parse_args():
@@ -290,27 +291,31 @@ def load_and_prepare_data(train_data_path, embed_data_path):
 def write_report(report_file_path, report_data):
     """Write the training report to a file (supports both local and S3 paths)."""
     if report_file_path.startswith("s3://"):
-        s3 = boto3.client("s3")
-        bucket_name = report_file_path.split("/")[2]
-        s3_key = "/".join(report_file_path.split("/")[3:])
-        
-        with tempfile.TemporaryDirectory() as tmpdir:
-            local_path = os.path.join(tmpdir, "temp_report.json")
-            with open(local_path, "w") as f:
-                json.dump(report_data, f, indent=4)
-            
-            try:
-                s3.upload_file(local_path, bucket_name, s3_key)
-                print(f"Report successfully uploaded to {report_file_path}")
-            except NoCredentialsError:
-                print("S3 upload failed for report: No AWS credentials found.")
-            except Exception as e:
-                print(f"S3 upload failed for report: {e}")
-                
-    else:
-        with open(report_file_path, "w") as f:
-            json.dump(report_data, f, indent=4)
+        try:
+            s3 = boto3.client("s3")
+            bucket_name = report_file_path.split("/")[2]
+            s3_key = "/".join(report_file_path.split("/")[3:])
 
+            with tempfile.TemporaryDirectory() as tmpdir:
+                local_path = os.path.join(tmpdir, "temp_report.json")
+                with open(local_path, "w") as f:
+                    json.dump(report_data, f, indent=4)
+
+                try:
+                    s3.upload_file(local_path, bucket_name, s3_key)
+                    print(f"Report successfully uploaded to {report_file_path}")
+                except NoCredentialsError:
+                    print("S3 upload failed for report: No AWS credentials found.")
+                except Exception as e:
+                    print(f"S3 upload failed for report: {e}")
+        except Exception as e:
+            print(f"Failed to initialize S3 client: {e}")
+    else:
+        try:
+            with open(report_file_path, "w") as f:
+                json.dump(report_data, f, indent=4)
+        except Exception as e:
+            print(f"Failed to write report locally: {e}")
 
 def train_model(config, train_ds, val_ds):
     """Train the model using query strategy-based active learning."""
@@ -321,7 +326,6 @@ def train_model(config, train_ds, val_ds):
     # Initialize model and criterion
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = get_model("cross_attn", embed_dim=1536, num_heads=8).to(device)
-    criterion = nn.BCEWithLogitsLoss()
 
     # ScalingConfig: same calculation as before
     hosts = _get_sagemaker_hosts()
@@ -337,6 +341,7 @@ def train_model(config, train_ds, val_ds):
             **({"GPU": 1} if use_gpu else {}),
         },
     )
+    run_id = time.strftime("%Y%m%d_%H%M%S")
 
     # Initialize selected data with a random batch to start the active learning loop
     selected_data = train_ds.take(1000)  # Random initial batch size: 1000
@@ -352,7 +357,7 @@ def train_model(config, train_ds, val_ds):
         datasets={"train": fine_tune_ds, "val": val_ds},
         run_config=RunConfig(
             storage_path=config.get("s3_artifact_path"),
-            name="train_initial",
+            name=f"train_initial_{run_id}",
             checkpoint_config=CheckpointConfig(
                 num_to_keep=1,
                 checkpoint_score_attribute="val_acc",
@@ -413,7 +418,7 @@ def train_model(config, train_ds, val_ds):
             datasets={"train": fine_tune_ds, "val": val_ds},
             run_config=RunConfig(
                 storage_path=config.get("s3_artifact_path"),
-                name=f"train_iter_{batch_num}",
+                name=f"train_iter_{batch_num}_{run_id}",
                 checkpoint_config=CheckpointConfig(
                     num_to_keep=1,
                     checkpoint_score_attribute="val_acc",
@@ -449,13 +454,12 @@ def train_model(config, train_ds, val_ds):
     # Save the final model
     write_report(report_file_path, report_data)
     save_model(model.state_dict(), config["s3_artifact_path"] + "/final_model.pth")
-    print("Training completed. Final performance met the threshold.")
     return
 
 
 if __name__ == "__main__":
     args = parse_args()
-    inject_aws_credentials()
+    secure_aws_region_for_ray()
     init_ray_cluster(num_workers_per_node=args.num_workers)
 
     hosts = _get_sagemaker_hosts()
@@ -488,3 +492,4 @@ if __name__ == "__main__":
     print(f"Train: {train_split.count()}, Val: {val_split.count()}")
 
     train_model(vars(args), train_split, val_split)
+    ray.shutdown()
