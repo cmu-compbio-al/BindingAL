@@ -13,7 +13,6 @@ import numpy as np
 
 from botocore.exceptions import NoCredentialsError
 from torch import nn
-from torch.nn.utils.rnn import pad_sequence
 from ray.train.torch import TorchTrainer, prepare_model
 from ray.train import ScalingConfig, get_dataset_shard, report, Checkpoint, RunConfig, CheckpointConfig
 from ray.data import ActorPoolStrategy
@@ -23,18 +22,8 @@ from bindingal.models import get_model
 from bindingal.strategies.uncertainty import UncertaintySelector
 
 from utils.distributed import _get_sagemaker_hosts, _get_current_host, _get_num_gpus, init_ray_cluster
+from utils.utils import secure_aws_region_for_ray, pad_embeddings, save_model
 
-def secure_aws_region_for_ray():
-    try:
-        session = boto3.Session()
-        if session.region_name:
-            os.environ["AWS_REGION"] = session.region_name
-            os.environ["AWS_DEFAULT_REGION"] = session.region_name
-            print(f"AWS Region ({session.region_name}) successfully injected. Tokens will auto-refresh.")
-    except Exception as e:
-        print(f"Warning: Could not inject AWS Region: {e}")
-    
-    return
 
 class EmbeddingMapper:
     def __init__(self, embed_dict_ref):
@@ -88,23 +77,6 @@ class EmbeddingMapper:
 
         return batch
 
-def pad_embeddings(embeddings):
-    if len(embeddings) == 0:
-        return torch.zeros((0, 0, 1536), dtype=torch.float32), torch.zeros((0, 0), dtype=torch.float32)
-
-    lengths = [len(emb) for emb in embeddings]
-    max_len = max(lengths)
-
-    if max_len == 0:
-        batch_size = len(embeddings)
-        return torch.zeros((batch_size, 0, 1536), dtype=torch.float32), torch.zeros((batch_size, 0), dtype=torch.float32)
-
-    # reshape(-1, 1536) ensures empty arrays (0,) become (0, 1536) for pad_sequence compatibility
-    tensor_list = [torch.tensor(emb, dtype=torch.float32).reshape(-1, 1536) for emb in embeddings]
-    padded_seqs = pad_sequence(tensor_list, batch_first=True)
-    lengths_tensor = torch.tensor(lengths)
-    mask = torch.arange(max_len)[None, :] < lengths_tensor[:, None]
-    return padded_seqs, mask.float()
 
 def run_forward(model: nn.Module, batch: dict, criterion: nn.Module):
     """Shared forward pass logic for train and val to avoid code duplication.
@@ -206,42 +178,6 @@ def train_loop_per_worker(config):
                 report(metrics, checkpoint=checkpoint)
         else:
             report(metrics)
-
-
-def save_model(state_dict, save_path):
-    """
-    Save the model state dictionary to an S3 path or local path.
-
-    Args:
-        state_dict: The model state dictionary to save.
-        save_path: The S3 or local path to save the model.
-
-    Returns:
-        None
-    """
-    if save_path.startswith("s3://"):
-        try:
-            s3 = boto3.client("s3")
-            bucket_name = save_path.split("/")[2]
-            s3_key = "/".join(save_path.split("/")[3:])
-            with tempfile.TemporaryDirectory() as tmpdir:
-                local_path = os.path.join(tmpdir, "model.pth")
-                torch.save(state_dict, local_path)
-                try:
-                    s3.upload_file(local_path, bucket_name, s3_key)
-                    print(f"Model successfully uploaded to {save_path}")
-                except NoCredentialsError:
-                    print("S3 upload failed: No AWS credentials found.")
-                except Exception as e:
-                    print(f"S3 upload failed: {e}")
-        except Exception as e:
-            print(f"Failed to initialize S3 client: {e}")
-    else:
-        try:
-            torch.save(state_dict, save_path)
-            print(f"Model successfully saved to {save_path}")
-        except Exception as e:
-            print(f"Failed to save model locally: {e}")
 
 
 def parse_args():
@@ -393,11 +329,11 @@ def train_model(config, train_ds, val_ds):
         if strategy == "passive":
             batch = train_ds.take(query_size)
         elif strategy == "mc_dropout":
-            selector = UncertaintySelector(model, method="mc_dropout")
-            batch = selector.select_batch(train_ds, query_size)
+            selector = UncertaintySelector(model, n_mc_samples=10)
+            batch = selector.select(train_ds, query_size, strategy="mc_dropout")
         elif strategy == "ensemble":
-            selector = UncertaintySelector(model, method="ensemble")
-            batch = selector.select_batch(train_ds, query_size)
+            selector = UncertaintySelector(model)
+            batch = selector.select(train_ds, query_size, strategy="ensemble")
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
 

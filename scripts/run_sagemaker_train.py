@@ -33,6 +33,7 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate for training (default: 1e-4)")
     parser.add_argument("--report_file", type=str, default='report.json', help="Path to report file (local or S3)")
     parser.add_argument("--num_workers", type=int, default=1, help="Number of workers per instance for distributed training (default: 1)")
+    parser.add_argument("--strategy", type=str, default="passive", help="Active learning strategy to use (default: passive)")
 
     return parser.parse_args()
 
@@ -74,6 +75,7 @@ if __name__ == "__main__":
             "report_file": args.report_file,
             "num_workers": args.num_workers,
             "s3_artifact_path": args.s3_artifact_path,
+            "strategy": args.strategy,
         },
         output_path=args.s3_artifact_path,
         sagemaker_session=sess,
