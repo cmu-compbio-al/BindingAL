@@ -1,5 +1,431 @@
-# TODO: Implement training loop for active learning model on DDP
+import os
+import time
+import tempfile
+import argparse
+import json
+
+import torch
+import ray
+import psutil
+
+import boto3
+import numpy as np
+
+from botocore.exceptions import NoCredentialsError
+from torch import nn
+from ray.train.torch import TorchTrainer, prepare_model
+from ray.train import ScalingConfig, get_dataset_shard, report, Checkpoint, RunConfig, CheckpointConfig
+from ray.data import ActorPoolStrategy
+from ray.train import get_context
+
+from bindingal.models import get_model
+from bindingal.strategies.uncertainty import UncertaintySelector
+
+from utils.distributed import _get_sagemaker_hosts, _get_current_host, _get_num_gpus, init_ray_cluster
+from utils.utils import secure_aws_region_for_ray, pad_embeddings, save_model
 
 
-def run_al_loop():
-    pass
+class EmbeddingMapper:
+    def __init__(self, embed_dict_ref):
+        # Receive an ObjectRef to avoid embedding the large dict in the UDF closure.
+        self.embed_dict = ray.get(embed_dict_ref)
+
+    def __call__(self, batch: dict) -> dict:
+        heavy_seqs = batch["heavy_seq"]
+        light_seqs = batch["light_seq"]
+        antigen_seqs = batch["antigen_seq"]
+
+        heavy_embs, light_embs, antigen_embs = [], [], []
+        keep_mask = []
+
+        # Look up embeddings and mark rows with missing embeddings to drop
+        for h, l, a in zip(heavy_seqs, light_seqs, antigen_seqs):
+            heavy_emb = self.embed_dict.get(h)
+            antigen_emb = self.embed_dict.get(a)
+
+            # Handle empty light_seq: use zero-length embedding instead of looking up
+            if l == "":
+                light_emb = np.zeros((0, 1536), dtype=np.float32)
+            else:
+                light_emb = self.embed_dict.get(l)
+
+            if heavy_emb is None or antigen_emb is None:
+                keep_mask.append(False)
+                # append placeholders to keep array lengths aligned (will be filtered out)
+                heavy_embs.append(None)
+                light_embs.append(None)
+                antigen_embs.append(None)
+            else:
+                keep_mask.append(True)
+                heavy_embs.append(heavy_emb)
+                light_embs.append(light_emb)
+                antigen_embs.append(antigen_emb)
+
+        # Build numpy arrays and filter batch rows with missing embeddings
+        batch["heavy_embedding"] = np.array(heavy_embs, dtype=object)
+        batch["light_embedding"] = np.array(light_embs, dtype=object)
+        batch["antigen_embedding"] = np.array(antigen_embs, dtype=object)
+
+        if not all(keep_mask):
+            mask = np.array(keep_mask, dtype=bool)
+            for k, v in list(batch.items()):
+                try:
+                    arr = np.array(v, dtype=object)
+                except Exception:
+                    continue
+                batch[k] = arr[mask]
+
+        return batch
+
+
+def run_forward(model: nn.Module, batch: dict, criterion: nn.Module):
+    """Shared forward pass logic for train and val to avoid code duplication.
+    
+    Args:
+        model (nn.Module): The model to evaluate.
+        batch (dict): The input batch of data.
+        criterion (nn.Module): The loss function.
+
+    Returns:
+        loss (torch.Tensor): The computed loss for the batch.
+        correct (int): The number of correct predictions in the batch.
+        n (int): The total number of samples in the batch.
+    """
+    device = next(model.parameters()).device
+    y = torch.tensor(batch["label"], dtype=torch.float32).to(device)
+    heavy_padded, heavy_mask = pad_embeddings(batch["heavy_embedding"])
+    light_padded, light_mask = pad_embeddings(batch["light_embedding"])
+    antigen_padded, antigen_mask = pad_embeddings(batch["antigen_embedding"])
+
+    heavy_padded, heavy_mask = heavy_padded.to(device), heavy_mask.to(device)
+    light_padded, light_mask = light_padded.to(device), light_mask.to(device)
+    antigen_padded, antigen_mask = antigen_padded.to(device), antigen_mask.to(device)
+
+    antibody_embeddings = torch.cat([heavy_padded, light_padded], dim=1)
+    antibody_mask = torch.cat([heavy_mask, light_mask], dim=1)
+
+    outputs = model(
+        ab_embeddings=antibody_embeddings,
+        ag_embeddings=antigen_padded,
+        ag_mask=antigen_mask,
+        ab_mask=antibody_mask,
+    )
+    loss = criterion(outputs.squeeze(-1), y)
+    preds = (torch.sigmoid(outputs.squeeze(-1)) >= 0.5).to(torch.int64)
+    correct = (preds == y.to(torch.int64)).sum().item()
+    return loss, correct, y.shape[0]
+
+def train_loop_per_worker(config):
+    train_data_shard = get_dataset_shard("train")
+    val_data_shard = get_dataset_shard("val")
+
+    # Retrieve the model from the config
+    model = get_model("cross_attn", embed_dim=1536, num_heads=8)
+    model = prepare_model(model)
+
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=1e-4)
+
+    rank = get_context().get_world_rank()
+
+    for epoch in range(config["epochs"]):
+        # Train on the training set
+        model.train()
+        train_loss_sum = 0.0
+        train_total = 0
+        for batch in train_data_shard.iter_batches(batch_size=config["batch_size"], batch_format="numpy"):
+            loss, _, n = run_forward(model, batch, criterion)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            train_loss_sum += loss.item() * n
+            train_total += n
+
+        train_loss = train_loss_sum / train_total if train_total > 0 else 0.0
+
+        # Evaluate on the validation set
+        model.eval()
+        val_loss_sum = 0.0
+        val_total = 0
+        val_correct = 0
+        with torch.no_grad():
+            for batch in val_data_shard.iter_batches(batch_size=config["batch_size"], batch_format="numpy"):
+                loss, correct, n = run_forward(model, batch, criterion)
+                val_loss_sum += loss.item() * n
+                val_correct += correct
+                val_total += n
+        
+        # Aggregate metrics across workers
+        device = next(model.parameters()).device
+        val_correct_tensor = torch.tensor(val_correct, dtype=torch.float32).to(device)
+        val_loss_sum_tensor = torch.tensor(val_loss_sum, dtype=torch.float32).to(device)
+        val_total_tensor = torch.tensor(val_total, dtype=torch.float32).to(device)
+        torch.distributed.all_reduce(val_correct_tensor, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(val_loss_sum_tensor, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(val_total_tensor, op=torch.distributed.ReduceOp.SUM)
+ 
+        val_loss = (val_loss_sum_tensor / val_total_tensor).item() if val_total_tensor.item() > 0 else 0.0
+        val_acc = (val_correct_tensor / val_total_tensor).item() if val_total_tensor.item() > 0 else 0.0
+ 
+        metrics = {"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss, "val_acc": val_acc}
+
+        # Only rank 0 prints metrics
+        if rank == 0:
+            print(f"Epoch {epoch}: Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f}, Val Acc={val_acc:.4f}")
+            with tempfile.TemporaryDirectory() as temp_ckpt_dir:
+                torch.save(model.module.state_dict(), os.path.join(temp_ckpt_dir, "model.pt"))
+                checkpoint = Checkpoint.from_directory(temp_ckpt_dir)
+                report(metrics, checkpoint=checkpoint)
+        else:
+            report(metrics)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train a model with query strategy-based active learning.")
+
+    # General arguments
+    parser.add_argument("--train_data_path", type=str, required=True,
+                        help="Path to the training data (local or S3).")
+    parser.add_argument("--embed_data_path", type=str, required=True,
+                        help="Path to the embedding data (local or S3).")
+    parser.add_argument("--batch_size", type=int, default=24, help="Batch size for training (default: 24).")
+    parser.add_argument("--query_size", type=int, default=96, help="Number of samples to query in each active learning iteration (default: 96).")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of epochs for training.")
+    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate for training.")
+    parser.add_argument("--finetune_performance_threshold", type=float, default=0.75,
+                        help="Performance threshold for training to stop. (default: 0.75)")
+    parser.add_argument("--report_file_path", type=str, default="report.json", help="Path to save the training report (optional).")
+    parser.add_argument("--num_workers", type=int, default=1, help="Number of workers for distributed training.")
+    parser.add_argument("--s3_artifact_path", type=str, default=None,
+                        help="S3 URI for Ray Train checkpoint storage shared across all nodes (e.g. s3://bucket/artifacts).")
+    parser.add_argument("--strategy", type=str, choices=["passive", "mc_dropout", "ensemble"], default="passive",
+                        help="Query strategy for active learning (default: passive).")
+
+    return parser.parse_args()
+
+def load_and_prepare_data(train_data_path, embed_data_path):
+    """Load and prepare datasets, including embedding mapping."""
+    train_data = ray.data.read_csv(train_data_path)
+    embed_data = ray.data.read_parquet(embed_data_path)
+
+    embed_records = embed_data.take_all()
+    embed_dict = {record["text"]: record["embedding"].reshape(-1, 1536) for record in embed_records}
+    embed_dict_ref = ray.put(embed_dict)
+
+    def map_embeddings(ds):
+        return ds.map_batches(
+            EmbeddingMapper,
+            fn_constructor_kwargs={"embed_dict_ref": embed_dict_ref},
+            batch_format="numpy",
+            compute=ActorPoolStrategy(min_size=1, max_size=1),
+        )
+
+    train_ds = map_embeddings(train_data).materialize()
+
+    return train_ds
+
+def write_report(report_file_path, report_data):
+    """Write the training report to a file (supports both local and S3 paths)."""
+    if report_file_path.startswith("s3://"):
+        try:
+            s3 = boto3.client("s3")
+            bucket_name = report_file_path.split("/")[2]
+            s3_key = "/".join(report_file_path.split("/")[3:])
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                local_path = os.path.join(tmpdir, "temp_report.json")
+                with open(local_path, "w") as f:
+                    json.dump(report_data, f, indent=4)
+
+                try:
+                    s3.upload_file(local_path, bucket_name, s3_key)
+                    print(f"Report successfully uploaded to {report_file_path}")
+                except NoCredentialsError:
+                    print("S3 upload failed for report: No AWS credentials found.")
+                except Exception as e:
+                    print(f"S3 upload failed for report: {e}")
+        except Exception as e:
+            print(f"Failed to initialize S3 client: {e}")
+    else:
+        try:
+            with open(report_file_path, "w") as f:
+                json.dump(report_data, f, indent=4)
+        except Exception as e:
+            print(f"Failed to write report locally: {e}")
+
+def train_model(config, train_ds, val_ds):
+    """Train the model using query strategy-based active learning."""
+    strategy = config["strategy"]
+    query_size = config["query_size"]
+    report_file_path = config["report_file_path"]
+
+    # Initialize model and criterion
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = get_model("cross_attn", embed_dim=1536, num_heads=8).to(device)
+
+    # ScalingConfig: same calculation as before
+    hosts = _get_sagemaker_hosts()
+    num_nodes = max(len(hosts), 1)
+    num_gpus_per_node = _get_num_gpus()
+    total_workers = num_nodes * max(num_gpus_per_node, 1)
+    use_gpu = num_gpus_per_node > 0
+    scaling_cfg = ScalingConfig(
+        num_workers=total_workers,
+        use_gpu=use_gpu,
+        resources_per_worker={
+            "CPU": max(psutil.cpu_count(logical=False) // max(num_gpus_per_node, 1), 1),
+            **({"GPU": 1} if use_gpu else {}),
+        },
+    )
+    run_id = time.strftime("%Y%m%d_%H%M%S")
+
+    # Initialize selected data with a random batch to start the active learning loop
+    selected_data = train_ds.take(1000)  # Random initial batch size: 1000
+    report_data = []
+
+    # Initial training on the first batch to get a starting performance metric
+    fine_tune_ds = ray.data.from_items(selected_data)
+
+    print("Phase 0: Initial Training on 1,000 samples using DDP...")
+    trainer = TorchTrainer(
+        train_loop_per_worker,
+        train_loop_config=config,
+        datasets={"train": fine_tune_ds, "val": val_ds},
+        run_config=RunConfig(
+            storage_path=config.get("s3_artifact_path"),
+            name=f"train_initial_{run_id}",
+            checkpoint_config=CheckpointConfig(
+                num_to_keep=1,
+                checkpoint_score_attribute="val_acc",
+                checkpoint_score_order="max",
+            ),
+        ),
+        scaling_config=scaling_cfg,
+    )
+    result = trainer.fit()
+
+    if result.checkpoint:
+        with result.checkpoint.as_directory() as ckpt_dir:
+            ckpt_state = torch.load(os.path.join(ckpt_dir, "model.pt"), map_location=device)
+        cleaned_state = {k.replace("module.", ""): v for k, v in ckpt_state.items()}
+        model.load_state_dict(cleaned_state)
+        model.to(device)
+        model.eval()
+
+    best_idx = result.metrics_dataframe["val_acc"].idxmax()
+    val_acc = result.metrics_dataframe.loc[best_idx, "val_acc"]
+    val_loss = result.metrics_dataframe.loc[best_idx, "val_loss"]
+    print(f"Phase 0 Completed. Initial Validation Accuracy: {val_acc:.4f}, Initial Validation Loss: {val_loss:.4f}")
+
+    batch_num = 0
+    # Track selected sample keys to prevent duplicate sampling across iterations
+    selected_keys = {record["heavy_seq"] + record["light_seq"] + record["antigen_seq"] for record in selected_data}
+
+    print(f"Phase 1: Active Learning with strategy '{strategy}'")
+    while batch_num <= 20:
+        print(f"Starting active learning iteration {batch_num + 1} with strategy '{strategy}'...")
+        # Select batch based on strategy
+        batch_num += 1
+        if strategy == "passive":
+            batch = train_ds.take(query_size)
+        elif strategy == "mc_dropout":
+            selector = UncertaintySelector(model, n_mc_samples=10)
+            batch = selector.select(train_ds, query_size, strategy="mc_dropout")
+        elif strategy == "ensemble":
+            selector = UncertaintySelector(model)
+            batch = selector.select(train_ds, query_size, strategy="ensemble")
+        else:
+            raise ValueError(f"Unknown strategy: {strategy}")
+
+        selected_data.extend(batch)
+        batch_full_seqs = {record["heavy_seq"] + record["light_seq"] + record["antigen_seq"] for record in batch}
+        selected_keys.update(batch_full_seqs)
+        train_ds = ray.data.from_items([r for r in train_ds.take_all() if (r["heavy_seq"] + r["light_seq"] + r["antigen_seq"]) not in selected_keys])
+
+        fine_tune_ds = ray.data.from_items(selected_data)
+
+        model.to("cpu")
+        torch.cuda.empty_cache()
+
+        # Fine-tune the model using DDP
+        trainer = TorchTrainer(
+            train_loop_per_worker,
+            train_loop_config=config,
+            datasets={"train": fine_tune_ds, "val": val_ds},
+            run_config=RunConfig(
+                storage_path=config.get("s3_artifact_path"),
+                name=f"train_iter_{batch_num}_{run_id}",
+                checkpoint_config=CheckpointConfig(
+                    num_to_keep=1,
+                    checkpoint_score_attribute="val_acc",
+                    checkpoint_score_order="max",
+                ),
+            ),
+            scaling_config=scaling_cfg,
+        )
+        result = trainer.fit()
+
+        # Load best checkpoint weights into the outer model (used by active learning selectors next loop)
+        model.to(device)
+        with result.checkpoint.as_directory() as ckpt_dir:
+            ckpt_state = torch.load(os.path.join(ckpt_dir, "model.pt"), map_location=device)
+        cleaned_state = {k.replace("module.", ""): v for k, v in ckpt_state.items()}
+        model.load_state_dict(cleaned_state)
+        model.eval()
+
+        best_idx = result.metrics_dataframe["val_acc"].idxmax()
+        val_acc = result.metrics_dataframe.loc[best_idx, "val_acc"]
+        val_loss = result.metrics_dataframe.loc[best_idx, "val_loss"]
+        print(f"Batch: {batch_num}, Validation Loss: {val_loss:.4f}, Validation Accuracy: {val_acc:.4f}")
+
+        # Log progress to the report file
+        report_entry = {
+            "batch": batch_num,
+            "strategy": strategy,
+            "val_loss": val_loss,
+            "val_acc": val_acc,
+        }
+        report_data.append(report_entry)
+
+    # Save the final model
+    write_report(report_file_path, report_data)
+    save_model(model.state_dict(), config["s3_artifact_path"] + "/final_model.pth")
+    return
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    secure_aws_region_for_ray()
+    init_ray_cluster(num_workers_per_node=args.num_workers)
+
+    hosts = _get_sagemaker_hosts()
+    current_host = _get_current_host()
+    head_host = hosts[0] if hosts else current_host
+
+    if current_host != head_host:
+        print(f"[{current_host}] Worker node ready. Waiting for tasks from head node.")
+        while True:
+            time.sleep(30)
+
+    # Load and prepare data
+    train_ds = load_and_prepare_data(args.train_data_path, args.embed_data_path)
+
+    # NOTE: Uncomment the block below to re-enable spike/COVID filtering.
+    # covid_keywords = ['sars-cov-2', 'sars-cov2', 'covid-19', 'spike']
+    # def _is_spike(record):
+    #     name = record.get("antigen_name")
+    #     if name is None:
+    #         return False
+    #     try:
+    #         return str(name).lower().startswith("spike")
+    #     except Exception:
+    #         return False
+    # non_spike_ds = train_ds.filter(lambda r: not _is_spike(r))
+    # spike_ds = train_ds.filter(_is_spike)
+    # train_ds = non_spike_ds
+
+    train_split, val_split = train_ds.train_test_split(test_size=0.2, shuffle=True, seed=42)
+    print(f"Train: {train_split.count()}, Val: {val_split.count()}")
+
+    train_model(vars(args), train_split, val_split)
+    ray.shutdown()
